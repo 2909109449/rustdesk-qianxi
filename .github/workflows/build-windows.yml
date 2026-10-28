@@ -40,6 +40,7 @@ env:
   APP_VERSION: "1.5.0"
   # ↓ 全部来自仓库 Variables 或本次手动输入，仓库里不存这些值
   APP_NAME: ${{ inputs.app_name || vars.QIANXI_APP_NAME }}
+  QIANXI_APP_NAME: ${{ inputs.app_name || vars.QIANXI_APP_NAME }}
   QIANXI_ID_SERVER: ${{ inputs.id_server || vars.QIANXI_ID_SERVER }}
   QIANXI_RELAY_SERVER: ${{ inputs.relay_server || vars.QIANXI_RELAY_SERVER }}
   QIANXI_API_SERVER: ${{ inputs.api_server || vars.QIANXI_API_SERVER }}
@@ -183,7 +184,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for v in APP_NAME QIANXI_ID_SERVER QIANXI_RELAY_SERVER QIANXI_API_SERVER QIANXI_PUBLIC_KEY; do
+          for v in APP_NAME QIANXI_APP_NAME QIANXI_ID_SERVER QIANXI_RELAY_SERVER QIANXI_API_SERVER QIANXI_PUBLIC_KEY; do
             if [ -z "${!v:-}" ]; then
               echo "::error::缺少 $v —— 请在 Actions Variables 里配置，或本次 Run workflow 时填写"
               exit 1
