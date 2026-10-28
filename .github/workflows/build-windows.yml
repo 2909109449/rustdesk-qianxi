@@ -189,6 +189,7 @@ jobs:
               exit 1
             fi
           done
+          echo "::add-mask::$QIANXI_PUBLIC_KEY"   # 公开仓库：公钥即便出现在日志里也打码
           echo "配置齐全：APP_NAME=$APP_NAME  ID=$QIANXI_ID_SERVER  API=$QIANXI_API_SERVER"
 
       - name: 打品牌补丁（名称 / 服务器 / 图标）
