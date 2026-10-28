@@ -1,0 +1,412 @@
+# ============================================================================
+# Qianxi(RustDesk) Windows x64 定制客户端 —— GitHub Actions 构建
+#
+# 做法：本仓库不保存 RustDesk 源码，只在构建时把「指定 tag 的上游源码」克隆下来，
+#       现场打品牌补丁（名称 / ID / 中继 / API / 公钥 / 图标），再用官方同款
+#       工具链编译。好处：
+#         · 版本号永远是官方版本号（默认 1.5.0，改 RUSTDESK_REF 即可升版）
+#         · 不 fork、不合并、不会被上游改动冲掉
+#         · 补丁漏打 → 脚本直接失败，不会产出「看着像定制版其实是原版」的假货
+# ============================================================================
+name: Build Qianxi(RustDesk) Windows x64
+
+on:
+  # 只手动触发：新建仓库后到 Settings → Secrets and variables → Actions → Variables
+  # 添加 QIANXI_APP_NAME / QIANXI_ID_SERVER / QIANXI_RELAY_SERVER / QIANXI_API_SERVER / QIANXI_PUBLIC_KEY，
+  # 之后每次 Run workflow 直接点即可；也可以每次在输入框里临时填（不落库）。
+  workflow_dispatch:
+    inputs:
+      app_name:
+        description: "显示名称（留空则用仓库 Variable QIANXI_APP_NAME）"
+        required: false
+      id_server:
+        description: "ID 服务器（留空则用 Variable QIANXI_ID_SERVER）"
+        required: false
+      relay_server:
+        description: "中继服务器（留空则用 Variable QIANXI_RELAY_SERVER）"
+        required: false
+      api_server:
+        description: "API 服务器 https://…（留空则用 Variable QIANXI_API_SERVER）"
+        required: false
+      public_key:
+        description: "服务器公钥（留空则用 Variable QIANXI_PUBLIC_KEY）"
+        required: false
+
+permissions:
+  contents: read
+
+env:
+  RUSTDESK_REF: "1.5.0"
+  APP_VERSION: "1.5.0"
+  # ↓ 全部来自仓库 Variables 或本次手动输入，仓库里不存这些值
+  APP_NAME: ${{ inputs.app_name || vars.QIANXI_APP_NAME }}
+  QIANXI_ID_SERVER: ${{ inputs.id_server || vars.QIANXI_ID_SERVER }}
+  QIANXI_RELAY_SERVER: ${{ inputs.relay_server || vars.QIANXI_RELAY_SERVER }}
+  QIANXI_API_SERVER: ${{ inputs.api_server || vars.QIANXI_API_SERVER }}
+  QIANXI_PUBLIC_KEY: ${{ inputs.public_key || vars.QIANXI_PUBLIC_KEY }}
+  RUST_VERSION: "1.75"
+  LLVM_VERSION: "15.0.6"
+  FLUTTER_VERSION: "3.24.5"
+  FLUTTER_BRIDGE_VERSION: "3.22.3"
+  FLUTTER_RUST_BRIDGE_VERSION: "1.80.1"
+  CARGO_EXPAND_VERSION: "1.0.95"
+  VCPKG_COMMIT_ID: "9e593bb18ea69cc5095e012465dcd675a822ed0d"
+  VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
+  VCPKG_TRIPLET: "x64-windows-static"
+
+jobs:
+  # ==========================================================================
+  # 1/3 Dart ↔ Rust 桥接代码（RustDesk 不在仓库里保存生成产物，必须现场生成）
+  # ==========================================================================
+  bridge:
+    name: 1/3 生成 Dart-Rust 桥接代码
+    runs-on: ubuntu-22.04
+    steps:
+      - name: 检出本仓库
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: 克隆上游 RustDesk 源码
+        run: |
+          git clone --depth 1 --branch "$RUSTDESK_REF" --recursive \
+            https://github.com/rustdesk/rustdesk.git src
+
+      - name: 安装系统依赖
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y clang cmake curl gcc g++ git libclang-dev \
+            libgtk-3-dev llvm-dev nasm ninja-build pkg-config wget
+
+      - name: 安装 Rust
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: rustfmt
+
+      - name: Rust 编译缓存
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          prefix-key: bridge-ubuntu
+
+      - name: 缓存 codegen 工具
+        uses: actions/cache@v4
+        with:
+          path: /tmp/flutter_rust_bridge
+          key: bridge-${{ env.FLUTTER_BRIDGE_VERSION }}
+
+      - name: 安装 Flutter（桥接用，固定 3.22.3）
+        uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_BRIDGE_VERSION }}
+          cache: true
+
+      - name: 生成 bridge
+        shell: bash
+        working-directory: src
+        run: |
+          set -euo pipefail
+          cargo install cargo-expand --version "$CARGO_EXPAND_VERSION" --locked
+          cargo install flutter_rust_bridge_codegen --version "$FLUTTER_RUST_BRIDGE_VERSION" --features uuid --locked
+          # Flutter 3.22.3 的 Dart 较旧，把 extended_text 降到 13.x 才能解析依赖
+          sed -i -e 's/extended_text: 14.0.0/extended_text: 13.0.0/g' flutter/pubspec.yaml
+          ( cd flutter && flutter pub get )
+          "$HOME/.cargo/bin/flutter_rust_bridge_codegen" \
+            --rust-input ./src/flutter_ffi.rs \
+            --dart-output ./flutter/lib/generated_bridge.dart \
+            --c-output ./flutter/macos/Runner/bridge_generated.h
+          cp ./flutter/macos/Runner/bridge_generated.h ./flutter/ios/Runner/bridge_generated.h
+          if [ ! -f ./flutter/lib/generated_bridge.freezed.dart ]; then
+            echo "::warning::codegen 未产出 generated_bridge.freezed.dart，改用 build_runner 补齐"
+            ( cd flutter && dart run build_runner build --delete-conflicting-outputs )
+          fi
+          ls -l ./src/bridge_generated*.rs ./flutter/lib/generated_bridge*.dart
+
+      - name: 上传 bridge 产物
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: bridge-artifact
+          if-no-files-found: warn
+          path: |
+            src/src/bridge_generated.rs
+            src/src/bridge_generated.io.rs
+            src/flutter/lib/generated_bridge.dart
+            src/flutter/lib/generated_bridge.freezed.dart
+            src/flutter/macos/Runner/bridge_generated.h
+            src/flutter/ios/Runner/bridge_generated.h
+
+  # ==========================================================================
+  # 2/3 WindowInjection.dll（隐私模式 / 窗口置顶辅助组件，官方独立仓库）
+  # ==========================================================================
+  topmost:
+    name: 2/3 编译 WindowInjection.dll
+    runs-on: windows-2022
+    continue-on-error: true
+    steps:
+      - name: 添加 MSBuild 到 PATH
+        uses: microsoft/setup-msbuild@6fb02220983dee41ce7ae257b6f4d8f9bf5ed4ce # v2
+
+      - name: 克隆并编译 RustDeskTempTopMostWindow
+        run: |
+          git clone https://github.com/rustdesk-org/RustDeskTempTopMostWindow topmost
+          cd topmost
+          git checkout ecd8d6a139eee76845ea66423fb739af450fda90
+          msbuild WindowInjection\WindowInjection.vcxproj -p:Configuration=Release -p:Platform=x64 /p:TargetVersion=Windows10
+
+      - name: 上传 WindowInjection.dll
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: topmost-x64
+          if-no-files-found: warn
+          path: topmost/WindowInjection/x64/Release/WindowInjection.dll
+
+  # ==========================================================================
+  # 3/3 主构建：打补丁 → 编译 → 打便携包 → 上传
+  # ==========================================================================
+  windows:
+    name: 3/3 编译 Qianxi(RustDesk) Windows x64
+    needs: [bridge, topmost]
+    if: ${{ always() && needs.bridge.result == 'success' }}
+    runs-on: windows-2022
+    permissions:
+      contents: write
+    steps:
+      - name: 检出本仓库（品牌资源 + 补丁脚本）
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: 克隆上游 RustDesk 源码
+        shell: bash
+        run: |
+          git clone --depth 1 --branch "$RUSTDESK_REF" --recursive \
+            https://github.com/rustdesk/rustdesk.git src
+
+      - name: 检查注入的服务器配置
+        shell: bash
+        run: |
+          set -euo pipefail
+          for v in APP_NAME QIANXI_ID_SERVER QIANXI_RELAY_SERVER QIANXI_API_SERVER QIANXI_PUBLIC_KEY; do
+            if [ -z "${!v:-}" ]; then
+              echo "::error::缺少 $v —— 请在 Actions Variables 里配置，或本次 Run workflow 时填写"
+              exit 1
+            fi
+          done
+          echo "配置齐全：APP_NAME=$APP_NAME  ID=$QIANXI_ID_SERVER  API=$QIANXI_API_SERVER"
+
+      - name: 打品牌补丁（名称 / 服务器 / 图标）
+        shell: bash
+        run: |
+          set -euo pipefail
+          python branding/apply-branding.py --repo src
+          echo "--- 主仓库改动 ---"
+          git -C src --no-pager diff --stat
+          echo "--- hbb_common（子模块）改动 ---"
+          git -C src/libs/hbb_common --no-pager diff --stat
+          echo "--- 生效校验 ---"
+          grep -m 5 -n 'RENDEZVOUS_SERVERS\|RS_PUB_KEY\|APP_NAME: RwLock' src/libs/hbb_common/src/config.rs
+          grep -m 5 -n 'apply_qianxi_branding' src/src/common.rs
+          grep -n 'ProductName\|FileDescription' src/flutter/windows/runner/Runner.rc
+
+      - name: 还原桥接产物
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: bridge-artifact
+          path: src
+
+      - name: 取 WindowInjection.dll（可选）
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: topmost-x64
+          path: _topmost
+
+      - name: 导出缓存变量（vcpkg 二进制缓存依赖）
+        uses: actions/github-script@d7906e4ad0b1822421a7e6a35d5ca353c962f410 # v6
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - name: 安装 LLVM / Clang
+        uses: KyleMayes/install-llvm-action@ebc0426251bc40c7cd31162802432c68818ab8f0 # v2.0.9
+        with:
+          version: ${{ env.LLVM_VERSION }}
+
+      - name: 安装 Flutter ${{ env.FLUTTER_VERSION }}
+        id: flutter
+        uses: subosito/flutter-action@2783a3f08e1baf891508463f8c6653c258246225 # v2.12.0
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          architecture: x64
+
+      - name: 替换为 RustDesk 定制 Flutter 引擎
+        run: |
+          flutter doctor -v
+          flutter precache --windows
+          Invoke-WebRequest -Uri https://github.com/rustdesk/engine/releases/download/main/windows-x64-release.zip -OutFile windows-x64-release.zip
+          Expand-Archive -Path windows-x64-release.zip -DestinationPath windows-x64-release -Force
+          $flutterCmd = Get-Command flutter -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $flutterCmd) { throw "flutter 不在 PATH 中" }
+          $flutterRoot = Split-Path -Parent (Split-Path -Parent $flutterCmd.Source)
+          $engineDir = Join-Path $flutterRoot 'bin\cache\artifacts\engine\windows-x64-release'
+          if (-not (Test-Path $engineDir)) { throw "找不到 Flutter 引擎目录：$engineDir" }
+          Write-Host "Flutter SDK: $flutterRoot"
+          Copy-Item -Recurse -Force windows-x64-release\* $engineDir
+
+      - name: 给 Flutter SDK 打下拉补丁（官方必需）
+        shell: bash
+        run: |
+          set -euo pipefail
+          FLUTTER_ROOT="$(dirname "$(dirname "$(command -v flutter)")")"
+          cp src/.github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff "$FLUTTER_ROOT/"
+          cd "$FLUTTER_ROOT"
+          git apply flutter_3.24.4_dropdown_menu_enableFilter.diff
+          echo "已给 $FLUTTER_ROOT 打补丁"
+
+      - name: 安装 Rust
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: x86_64-pc-windows-msvc
+          components: rustfmt
+
+      - name: Rust 编译缓存
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          prefix-key: windows-x64
+
+      - name: 准备 vcpkg（带 GitHub Actions 二进制缓存）
+        uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11
+        with:
+          vcpkgDirectory: C:\vcpkg
+          vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
+          doNotCache: false
+
+      - name: 编译 vcpkg 依赖（ffmpeg / vpx / aom 等，首次 20-40 分钟）
+        shell: bash
+        env:
+          VCPKG_DEFAULT_HOST_TRIPLET: ${{ env.VCPKG_TRIPLET }}
+        run: |
+          set -euo pipefail
+          cd src
+          if ! "$VCPKG_ROOT/vcpkg" install --triplet "$VCPKG_TRIPLET" \
+               --x-install-root="$VCPKG_ROOT/installed"; then
+            echo "::error::vcpkg 安装失败，日志如下"
+            find "${VCPKG_ROOT}/" -name "*.log" -exec sh -c 'echo "=== $1 ==="; tail -n 40 "$1"' _ {} \;
+            exit 1
+          fi
+
+      - name: 编译 RustDesk 主体（约 20-40 分钟）
+        working-directory: src
+        run: |
+          python build.py --portable --flutter --skip-portable-pack --hwcodec --vram
+          if (-not (Test-Path ./flutter/build/windows/x64/runner/Release)) { throw "构建产物目录不存在" }
+          Move-Item -Force ./flutter/build/windows/x64/runner/Release ./rustdesk
+          Write-Host "产物目录："
+          Get-ChildItem ./rustdesk | Select-Object -First 20 Name
+
+      - name: 主程序改名为 ${{ env.APP_NAME }}.exe
+        working-directory: src
+        run: |
+          $old = './rustdesk/rustdesk.exe'
+          $new = "./rustdesk/${{ env.APP_NAME }}.exe"
+          if (Test-Path $old) { Move-Item -Force $old $new }
+          if (-not (Test-Path $new)) { throw "主程序改名失败：$new 不存在" }
+          Write-Host "主程序："
+          Get-ChildItem ./rustdesk -Filter *.exe | Select-Object Name, Length
+
+      - name: 附加虚拟显示器 usbmmidd（可选）
+        continue-on-error: true
+        working-directory: src
+        run: |
+          Invoke-WebRequest -Uri https://github.com/rustdesk-org/rdev/releases/download/usbmmidd_v2/usbmmidd_v2.zip -OutFile usbmmidd_v2.zip
+          Expand-Archive usbmmidd_v2.zip -DestinationPath . -Force
+          Remove-Item -Path usbmmidd_v2\Win32 -Recurse -ErrorAction SilentlyContinue
+          Remove-Item -Path "usbmmidd_v2\deviceinstaller64.exe","usbmmidd_v2\deviceinstaller.exe","usbmmidd_v2\usbmmidd.bat" -ErrorAction SilentlyContinue
+          Move-Item -Force ./usbmmidd_v2 ./rustdesk
+
+      - name: 附加远程打印驱动（可选）
+        continue-on-error: true
+        working-directory: src
+        run: |
+          Invoke-WebRequest -Uri https://github.com/rustdesk/hbb_common/releases/download/driver/rustdesk_printer_driver_v4-1.4.zip -OutFile rustdesk_printer_driver_v4-1.4.zip
+          Invoke-WebRequest -Uri https://github.com/rustdesk/hbb_common/releases/download/driver/printer_driver_adapter.zip -OutFile printer_driver_adapter.zip
+          Expand-Archive rustdesk_printer_driver_v4-1.4.zip -DestinationPath . -Force
+          New-Item -ItemType Directory -Force -Path ./rustdesk/drivers | Out-Null
+          Move-Item -Force ./rustdesk_printer_driver_v4-1.4 ./rustdesk/drivers/RustDeskPrinterDriver
+          Expand-Archive printer_driver_adapter.zip -DestinationPath . -Force
+          Move-Item -Force ./printer_driver_adapter.dll ./rustdesk
+
+      - name: 放入 WindowInjection.dll（可选）
+        continue-on-error: true
+        run: Copy-Item -Force _topmost\WindowInjection.dll src\rustdesk\WindowInjection.dll
+
+      - name: 提取 Runner.res（给便携 exe 附版本资源）
+        continue-on-error: true
+        shell: bash
+        working-directory: src
+        run: |
+          runner_res=$(find . -name "Runner.res" -print -quit)
+          echo "Runner.res: $runner_res"
+          if [ -n "$runner_res" ]; then cp "$runner_res" ./libs/portable/Runner.res; fi
+
+      - name: 生成便携单文件 exe
+        shell: bash
+        working-directory: src/libs/portable
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python generate.py -f ../../rustdesk/ -o . -e "../../rustdesk/$APP_NAME.exe"
+          mkdir -p ../../dist
+          cp ./target/release/rustdesk-portable-packer.exe \
+             "../../dist/$APP_NAME-$APP_VERSION-x86_64.exe"
+          ls -l ../../dist
+
+      - name: 编译 MSI 安装包（可选，失败不影响 exe）
+        continue-on-error: true
+        uses: microsoft/setup-msbuild@6fb02220983dee41ce7ae257b6f4d8f9bf5ed4ce # v2
+
+      - name: 生成 MSI
+        continue-on-error: true
+        working-directory: src/res/msi
+        run: |
+          python preprocess.py --arp --app-name "$env:APP_NAME" -d ../../rustdesk
+          nuget restore msi.sln
+          msbuild msi.sln -p:Configuration=Release -p:Platform=x64 /p:TargetVersion=Windows10
+          $msi = Get-ChildItem ./Package/bin/*/Release/en-us/Package.msi | Select-Object -First 1
+          New-Item -ItemType Directory -Force -Path ../../dist | Out-Null
+          Copy-Item -Force $msi.FullName "../../dist/$($env:APP_NAME)-$($env:APP_VERSION)-x86_64.msi"
+          Get-ChildItem ../../dist
+
+      - name: 上传 · 便携单文件 exe
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ env.APP_NAME }}-${{ env.APP_VERSION }}-portable-exe
+          if-no-files-found: error
+          path: src/dist/*.exe
+
+      - name: 上传 · 绿色目录版
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ env.APP_NAME }}-${{ env.APP_VERSION }}-windows-x64-folder
+          if-no-files-found: error
+          path: src/rustdesk
+
+      - name: 上传 · MSI 安装包（可选）
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ env.APP_NAME }}-${{ env.APP_VERSION }}-msi
+          if-no-files-found: ignore
+          path: src/dist/*.msi
+
+      - name: 发布到 Release（可选，失败不影响产物）
+        continue-on-error: true
+        uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844 # v1
+        with:
+          tag_name: qianxi-${{ env.APP_VERSION }}
+          name: ${{ env.APP_NAME }} ${{ env.APP_VERSION }}
+          prerelease: true
+          files: |
+            src/dist/*.exe
+            src/dist/*.msi
