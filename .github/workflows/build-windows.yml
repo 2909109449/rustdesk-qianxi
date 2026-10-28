@@ -352,16 +352,20 @@ jobs:
 
       - name: 生成便携单文件 exe
         shell: bash
-        working-directory: src/libs/portable
+        working-directory: src
         run: |
           set -euo pipefail
-          python -m pip install --upgrade pip
-          python -m pip install -r requirements.txt
-          python generate.py -f ../../rustdesk/ -o . -e "../../rustdesk/$APP_NAME.exe"
-          mkdir -p ../../dist
-          cp ./target/release/rustdesk-portable-packer.exe \
-             "../../dist/$APP_NAME-$APP_VERSION-x86_64.exe"
-          ls -l ../../dist
+          # 便携打包器必须在仓库根打（cargo 的 target 目录在仓库根，不在 libs/portable 下）
+          sed -i '/dpiAware/d' res/manifest.xml || true
+          ( cd libs/portable \
+            && python -m pip install -q -r requirements.txt \
+            && python generate.py -f ../../rustdesk/ -o . -e "../../rustdesk/$APP_NAME.exe" )
+          PACKER="$(find . -maxdepth 4 -path '*/release/rustdesk-portable-packer.exe' -print -quit)"
+          if [ -z "$PACKER" ]; then echo "::error::找不到 rustdesk-portable-packer.exe"; exit 1; fi
+          echo "packer: $PACKER"
+          mkdir -p dist
+          cp "$PACKER" "dist/$APP_NAME-$APP_VERSION-x86_64.exe"
+          ls -l dist
 
       - name: 编译 MSI 安装包（可选，失败不影响 exe）
         continue-on-error: true
