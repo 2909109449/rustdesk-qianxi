@@ -200,11 +200,30 @@ fn {GUARD_FN}() {{
             shutil.copyfile(src, dst)
             self.changed.append(rel)
 
+    # ---------------- 4b. MSI：修 preprocess.py 调 exe 的引号 bug ----------------
+    def patch_msi_preprocess(self):
+        """官方 preprocess.py 用 shell=True + 未加引号的路径启动 exe；
+        产品名里带括号/空格时会被 cmd.exe 拆坏（实测报 “Qianxi 不是内部或外部命令”）。"""
+        rel = "res/msi/preprocess.py"
+        if not (self.repo / rel).is_file():
+            return
+        src = self.read(rel)
+        if 'f\'"{dist_app}" {args}\'' in src:
+            return  # 已修
+        src = self.sub_once(
+            src,
+            r'\s*f"\{dist_app\} \{args\}",',
+            '            f\'"{dist_app}" {args}\',',
+            "preprocess.py Popen 路径加引号",
+        )
+        self.write(rel, src)
+
     def run(self):
         self.patch_hbb_config()
         self.patch_common_rs()
         self.patch_runner_rc()
         self.patch_icons()
+        self.patch_msi_preprocess()
 
 
 def main() -> int:
